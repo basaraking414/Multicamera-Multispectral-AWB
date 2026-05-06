@@ -1,0 +1,105 @@
+﻿# =============================================================================
+# AWB Transformer 项目配置文件
+# 所有路径均为相对于项目根目录的相对路径，方便跨机器复现
+# =============================================================================
+
+project:
+  name: "awb_transformer"
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# 数据路径 & 预处理
+# ---------------------------------------------------------------------------
+data:
+  root_dir: "./data"
+
+  # 预处理输入（dump 数据源，按实际路径修改）
+  dump_camera_dir: "./data/image"        # JPG/DNG 源目录
+  dump_mcs_dir: "./data/McsBin"          # MCS .bin 源目录
+
+  # 预处理中间产物
+  image_dir: "image"                     # 匹配后的 JPG
+  image_dng_dir: "image_dng"             # 匹配后的 DNG
+  mcs_bin_dir: "McsBin"                  # 匹配后的 MCS .bin
+  mcs_npy_dir: "Mcsnpy"                  # 解析后的 MCS .npy (9ch)
+  image_processed_dir: "image_processed" # 处理后的 .npz
+
+  # 调试输出
+  debug_white_patch_dir: "image_processed/debug_white_patch"
+  debug_mcs_dir: "Mcsnpy/debug_mcs"
+
+  # 通用参数
+  img_size: [128, 128]
+  mcs_size: [128, 128]
+  raw_extensions: [".dng", ".nef", ".arw"]
+
+# ---------------------------------------------------------------------------
+# 外部工具路径（可设为 null 使用系统 PATH）
+# ---------------------------------------------------------------------------
+external_tools:
+  exiftool_path: null   # 例如 "C:/tools/exiftool.exe" 或 null（使用 PATH 中的 exiftool）
+
+# ---------------------------------------------------------------------------
+# 模型
+# ---------------------------------------------------------------------------
+model:
+  name: "AWBTransformer"       # 模型选择
+  dim: 64
+  num_heads: 4
+  grid_size: 16
+  use_positional_encoding: true
+  focal_embed_dim: 16            # 焦距编码维度（替代 sensor_id embedding）
+  predict_ccm: true           # 是否启用 CCM 预测头（输出 sRGB）
+
+# ---------------------------------------------------------------------------
+# 训练
+# ---------------------------------------------------------------------------
+training:
+  epochs: 100
+  scene_batch_size: 1
+  learning_rate: 0.0001
+
+  lr_scheduler: "cosine"       # "cosine" | "plateau" | "none"
+  lr_scheduler_params:
+    # cosine 参数
+    T_max: 100
+    eta_min: 0.000001
+    # plateau 参数
+    factor: 0.5
+    patience: 10
+    threshold: 0.0001
+
+  loss_weights:
+    awb: 1.0
+    reconstruction: 10.0
+    consistency: 2.0
+
+  loss_crop_size: 64            # 后裁剪统一尺寸（全视场模式下裁剪重叠区算 loss）
+
+# ---------------------------------------------------------------------------
+# Checkpoint
+# ---------------------------------------------------------------------------
+checkpoint:
+  dir: "./checkpoints"
+  best_model: "best_model.pth"
+  latest: "latest.pth"
+  interval: 10                 # 每隔 N 个 epoch 保存周期性 checkpoint
+  resume_from: null            # 断点续训路径，null 表示从头训练
+
+# ---------------------------------------------------------------------------
+# 调试
+# ---------------------------------------------------------------------------
+debug:
+  output_dir: "./debug_outputs"
+  save_interval: 5             # 每隔 N 个 epoch 保存 debug 图像
+
+# ---------------------------------------------------------------------------
+# 推理
+# ---------------------------------------------------------------------------
+inference:
+  checkpoint: "./checkpoints/best_model.pth"  # 推理用的模型权重
+  output_dir: "./inference_outputs"
+  save_gain_map: true
+  save_corrected_image: true
+  img_size: [128, 128]
+  mcs_size: [128, 128]

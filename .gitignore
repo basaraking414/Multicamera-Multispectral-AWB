@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Data (large binary files)
+data/image/
+data/image_dng/
+data/McsBin/
+data/Mcsnpy/
+data/image_processed/
+data/image_raw/
+*.npy
+*.npz
+*.bin
+*.dng
+*.nef
+*.arw
+*.jpg
+*.jpeg
+*.png
+
+# Checkpoints (large model weights)
+checkpoints/
+*.pth
+
+# Outputs
+debug_outputs/
+inference_outputs/
+
+# PPT (large generated file)
+*.pptx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.env.local
+
+# Logs
+*.log
