@@ -3,6 +3,15 @@ from typing import Dict, Optional
 import torch
 import torch.nn.functional as F
 
+from geometry_utils import safe_inv_ccm
+
+# CIE标准XYZ到sRGB转换矩阵(D65光源)
+XYZ_TO_SRGB = torch.tensor([
+    [3.2406, -1.5372, -0.4986],
+    [-0.9689, 1.8758, 0.0415],
+    [0.0557, -0.2040, 1.0570],
+], dtype=torch.float32)
+
 
 # =============================================================================
 # 重叠区域裁剪工具（后裁剪）
@@ -62,17 +71,18 @@ def srgb_gamma(linear: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 # =============================================================================
 # 损失函数
 # =============================================================================
-def _spatial_mean_gain(pred_gain: torch.Tensor) -> torch.Tensor:
-    if pred_gain.dim() == 4:
-        return pred_gain.mean(dim=(1, 2))
-    return pred_gain
-
-
 def angular_loss(pred_gain: torch.Tensor, gt_gain: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    pred_vec = F.normalize(_spatial_mean_gain(pred_gain), dim=-1, eps=eps)
+    """逐像素角度损失：对每个像素计算 gain 方向误差，再空间平均。
+
+    gt_gain [B*S, 3] 通过广播与 pred_gain [B*S, H, W, 3] 逐像素比较。
+    """
+    pred_vec = F.normalize(pred_gain, dim=-1, eps=eps)
     gt_vec = F.normalize(gt_gain, dim=-1, eps=eps)
+    # 将 gt_vec reshape 为 [B*S, 1, 1, 3] 以便与 pred_vec [B*S, H, W, 3] 广播
+    if gt_vec.dim() == 2:
+        gt_vec = gt_vec.unsqueeze(1).unsqueeze(1)
     cosine = torch.clamp((pred_vec * gt_vec).sum(dim=-1), -1.0 + eps, 1.0 - eps)
-    return torch.acos(cosine).mean()
+    return (1.0 - cosine).mean()
 
 
 def reconstruction_loss(pred_image: torch.Tensor, gt_image: torch.Tensor) -> torch.Tensor:
@@ -98,6 +108,31 @@ def srgb_loss(
     return F.l1_loss(pred_srgb, gt_srgb)
 
 
+def spatial_smoothness_loss(
+    gain_map: torch.Tensor,
+    raw_image: torch.Tensor,
+    edge_weight: float = 10.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """边缘感知的空间平滑损失，约束 gain map 的空间连续性。
+
+    在 raw 图像有强边缘处降低平滑惩罚（保留光照跳变边界）。
+    """
+    # gain 梯度
+    gain_dy = gain_map[:, 1:, :, :] - gain_map[:, :-1, :, :]
+    gain_dx = gain_map[:, :, 1:, :] - gain_map[:, :, :-1, :]
+
+    # raw 灰度图梯度作为边缘感知权重
+    raw_gray = raw_image.mean(dim=-1, keepdim=True)
+    raw_dy = raw_gray[:, 1:, :, :] - raw_gray[:, :-1, :, :]
+    raw_dx = raw_gray[:, :, 1:, :] - raw_gray[:, :, :-1, :]
+
+    w_y = torch.exp(-edge_weight * raw_dy.abs())
+    w_x = torch.exp(-edge_weight * raw_dx.abs())
+
+    return (w_y * gain_dy.abs()).mean() + (w_x * gain_dx.abs()).mean()
+
+
 def build_srgb_gt(
     raw: torch.Tensor,
     gt_gain: torch.Tensor,
@@ -109,21 +144,14 @@ def build_srgb_gt(
     流程: raw * gain → cameraRGB → XYZ → linear sRGB → gamma → sRGB
     """
     # cameraRGB → XYZ: inverse of xyz2camera_rgb
-    ccm1_inv = torch.linalg.inv(ccm1.float())
-    ccm2_inv = torch.linalg.inv(ccm2.float())
-    # 使用两个 CCM 的平均（或按场景光照选择，这里简化为平均）
-    ccm_inv = (ccm1_inv + ccm2_inv) / 2.0  # [B, 3, 3]
+    # 用 ccm1（典型 D65）作为主光照 CCM，避免平均两个不同光照的矩阵
+    ccm_inv = safe_inv_ccm(ccm1)  # [B, 3, 3]
 
     # AWB 校正
     corrected = raw * gt_gain.unsqueeze(1).unsqueeze(2)  # [B, H, W, 3]
 
     # XYZ → linear sRGB 标准矩阵
-    xyz_to_srgb = torch.tensor(
-        [[3.2406, -1.5372, -0.4986],
-         [-0.9689, 1.8758, 0.0415],
-         [0.0557, -0.2040, 1.0570]],
-        dtype=torch.float32, device=raw.device,
-    )
+    xyz_to_srgb = XYZ_TO_SRGB.to(raw.device)
 
     # cameraRGB → linear sRGB
     B, H, W, _ = corrected.shape
@@ -148,6 +176,9 @@ def total_loss(
     weights: Dict[str, float],
     crop_ratios: Optional[torch.Tensor] = None,
     loss_crop_size: int = 64,
+    # 空间平滑（可选）
+    raw_image: Optional[torch.Tensor] = None,
+    smoothness_weight: float = 0.0,
     # sRGB 相关（可选）
     pred_srgb: Optional[torch.Tensor] = None,
     gt_srgb: Optional[torch.Tensor] = None,
@@ -155,36 +186,44 @@ def total_loss(
     """聚合所有损失。
 
     Args:
-        pred_gain:    [B*S, ...] 预测 gain（angular_loss 直接使用）
+        pred_gain:    [B*S, H, W, 3] 预测 gain（逐像素角度损失）
         gt_gain:      [B*S, 3]
-        pred_image:   [B*S, H, W, 3] 预测校正图（reconstruction_loss 使用）
+        pred_image:   [B*S, H, W, 3] 预测校正图
         gt_image:     [B*S, H, W, 3] GT 校正图
-        scene_pred_image: [B, S, H, W, 3] 场景分组（consistency_loss 使用）
+        scene_pred_image: [B, S, H, W, 3] 场景分组
         weights:      损失权重 dict
         crop_ratios:  [B, S] 后裁剪比例，None 则不做裁剪
         loss_crop_size: 后裁剪的统一尺寸
+        raw_image:    [B*S, H, W, 3] 原始 RAW（空间平滑的 edge-aware 用）
+        smoothness_weight: 空间平滑损失权重
         pred_srgb:    [B*S, H, W, 3] 预测 sRGB（可选）
         gt_srgb:      [B*S, H, W, 3] GT sRGB（可选）
     """
-    awb = angular_loss(pred_gain, gt_gain)
-
-    # 后裁剪：在重叠区域计算 reconstruction + consistency
+    # 后裁剪：所有 loss 在重叠区域上计算
     if crop_ratios is not None:
         B, S = scene_pred_image.shape[:2]
         H, W, C = scene_pred_image.shape[2:]
 
-        # pred_image 和 gt_image 都是 [B*S, H, W, 3]，需要 reshape 到 [B, S, H, W, 3]
+        # pred_image/gt_image: [B*S, H, W, 3] → [B, S, H, W, 3] → 裁剪
         pred_reshape = pred_image.reshape(B, S, H, W, C)
         gt_reshape = gt_image.reshape(B, S, H, W, C)
+        pred_cropped = crop_to_overlap(pred_reshape, crop_ratios, loss_crop_size)
+        gt_cropped = crop_to_overlap(gt_reshape, crop_ratios, loss_crop_size)
 
-        pred_cropped = crop_to_overlap(pred_reshape, crop_ratios, loss_crop_size)  # [B, S, t, t, 3]
-        gt_cropped = crop_to_overlap(gt_reshape, crop_ratios, loss_crop_size)      # [B, S, t, t, 3]
+        # 也对 pred_gain 做裁剪，使所有 loss 作用在同一空间区域
+        gain_reshape = pred_gain.reshape(B, S, *pred_gain.shape[1:])
+        gain_cropped = crop_to_overlap(gain_reshape, crop_ratios, loss_crop_size)
+        # 展平回 [B*S, t, t, 3] 用于 angular loss
+        _, S, t, _, _ = gain_cropped.shape
+        gain_flat = gain_cropped.reshape(B * S, t, t, 3)
 
         rec = reconstruction_loss(pred_cropped, gt_cropped)
         consistency = scene_consistency_loss(pred_cropped)
+        awb = angular_loss(gain_flat, gt_gain)
     else:
         rec = reconstruction_loss(pred_image, gt_image)
         consistency = scene_consistency_loss(scene_pred_image)
+        awb = angular_loss(pred_gain, gt_gain)
 
     total = weights["awb"] * awb + weights["reconstruction"] * rec + weights["consistency"] * consistency
 
@@ -195,11 +234,23 @@ def total_loss(
         "total": total,
     }
 
+    # 空间平滑损失（可选，与裁剪保持一致）
+    if smoothness_weight > 0 and raw_image is not None:
+        if crop_ratios is not None:
+            raw_reshape = raw_image.reshape(B, S, *raw_image.shape[1:])
+            raw_cropped = crop_to_overlap(raw_reshape, crop_ratios, loss_crop_size)
+            _, S, t, _, _ = raw_cropped.shape
+            smooth = spatial_smoothness_loss(gain_flat, raw_cropped.reshape(B * S, t, t, 3))
+        else:
+            smooth = spatial_smoothness_loss(pred_gain, raw_image)
+        result["smoothness"] = smooth
+        result["total"] = result["total"] + smoothness_weight * smooth
+
     # sRGB 损失（可选）
     if pred_srgb is not None and gt_srgb is not None:
         srgb = srgb_loss(pred_srgb, gt_srgb)
         srgb_weight = weights.get("srgb", 1.0)
         result["srgb"] = srgb
-        result["total"] = total + srgb_weight * srgb
+        result["total"] = result["total"] + srgb_weight * srgb
 
     return result

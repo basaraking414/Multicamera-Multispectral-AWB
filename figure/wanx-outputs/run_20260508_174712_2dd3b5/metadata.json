@@ -1,0 +1,28 @@
+{
+  "run_id": "run_20260508_174712_2dd3b5",
+  "timestamp": "2026-05-08T18:18:58.048639",
+  "vlm_provider": "openrouter",
+  "vlm_model": "qwen3.6-plus",
+  "image_provider": "dashscope_imagen",
+  "image_model": "wan2.5-t2i-preview",
+  "refinement_iterations": 10,
+  "seed": null,
+  "config_snapshot": {
+    "vlm_provider": "openrouter",
+    "vlm_model": "qwen3.6-plus",
+    "image_provider": "dashscope_imagen",
+    "image_model": "wan2.5-t2i-preview",
+    "openai_api_key": "sk-636b26a61e11449d92f899bf4ec1bd27",
+    "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "openai_model_name": "qwen3.6-plus",
+    "num_retrieval_examples": 10,
+    "refinement_iterations": 10,
+    "output_resolution": "2k",
+    "reference_set_path": "data/reference_sets",
+    "guidelines_path": "data/guidelines",
+    "output_dir": "outputs",
+    "save_iterations": true,
+    "openrouter_api_key": null,
+    "skip_ssl_verification": false
+  }
+}

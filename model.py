@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from geometry_utils import safe_inv_ccm
+
 
 # =============================================================================
 # 2D Sinusoidal Positional Encoding
@@ -15,15 +17,17 @@ class PositionalEncoding2D(nn.Module):
         self.grid_h = grid_h
         self.grid_w = grid_w
 
-        pe = torch.zeros(grid_h * grid_w, dim)
         y_pos = torch.arange(grid_h).unsqueeze(1).repeat(1, grid_w).flatten()
         x_pos = torch.arange(grid_w).unsqueeze(0).repeat(grid_h, 1).flatten()
 
+        # 确保 dim_y 和 dim_x 均为偶数，避免切片宽度不匹配
         dim_half = dim // 2
-        if dim_half % 2 != 0:
-            dim_half -= 1
         dim_y = dim_half
-        dim_x = dim - dim_y
+        dim_x = dim - dim_half
+        if dim_y % 2 != 0:
+            dim_y -= 1
+        if dim_x % 2 != 0:
+            dim_x -= 1
 
         div_y = torch.exp(torch.arange(0, dim_y, 2) * (-math.log(10000.0) / dim_y))
         div_x = torch.exp(torch.arange(0, dim_x, 2) * (-math.log(10000.0) / dim_x))
@@ -36,7 +40,10 @@ class PositionalEncoding2D(nn.Module):
         pe_x[:, 0::2] = torch.sin(x_pos.unsqueeze(1) * div_x.unsqueeze(0))
         pe_x[:, 1::2] = torch.cos(x_pos.unsqueeze(1) * div_x.unsqueeze(0))
 
-        pe = torch.cat([pe_y, pe_x], dim=1)  # [grid_h*grid_w, dim]
+        pe = torch.cat([pe_y, pe_x], dim=1)  # [grid_h*grid_w, dim_y+dim_x]
+        # 补齐到原始 dim（dim_y+dim_x 可能小于 dim）
+        if pe.shape[1] < dim:
+            pe = torch.cat([pe, torch.zeros(grid_h * grid_w, dim - pe.shape[1])], dim=1)
         self.register_buffer("pe", pe.unsqueeze(0))  # [1, N, dim]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -59,8 +66,8 @@ class CCMEncoder(nn.Module):
         self.bias_head = nn.Linear(dim, dim)
 
     def forward(self, ccm1, ccm2):
-        ccm1_inv = torch.linalg.inv(ccm1.float())
-        ccm2_inv = torch.linalg.inv(ccm2.float())
+        ccm1_inv = safe_inv_ccm(ccm1)
+        ccm2_inv = safe_inv_ccm(ccm2)
         B = ccm1.shape[0]
         ccm_flat = torch.cat([ccm1_inv.reshape(B, -1), ccm2_inv.reshape(B, -1)], dim=-1)
         feat = self.net(ccm_flat)
@@ -191,7 +198,7 @@ class AWBTransformer(nn.Module):
             self.pos_enc = None
 
         # ===== tokens =====
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
 
         # ===== CCM 编码器 =====
         self.ccm_encoder = CCMEncoder(dim)
@@ -205,6 +212,13 @@ class AWBTransformer(nn.Module):
 
         # CLS聚合
         self.cls_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+
+        # ===== Pre-LN LayerNorm（残差连接前的归一化）=====
+        self.norm_raw = nn.LayerNorm(dim)
+        self.norm_cross_q = nn.LayerNorm(dim)
+        self.norm_cross_kv = nn.LayerNorm(dim)
+        self.norm_cls_q = nn.LayerNorm(dim)
+        self.norm_cls_kv = nn.LayerNorm(dim)
 
         # ===== CLS调制 =====
         self.cls_scale = nn.Linear(dim, dim)
@@ -263,15 +277,27 @@ class AWBTransformer(nn.Module):
         # ===== CLS =====
         cls_token = self.cls_token.expand(B, -1, -1)
 
-        # ===== Stage1: 标准颜色特征 self-attention =====
-        refined_tokens, _ = self.raw_self_attn(calibrated_tokens, calibrated_tokens, calibrated_tokens)
+        # ===== Stage1: 标准颜色特征 self-attention（Pre-LN + 残差）=====
+        refined_tokens = calibrated_tokens + self.raw_self_attn(
+            self.norm_raw(calibrated_tokens),
+            self.norm_raw(calibrated_tokens),
+            self.norm_raw(calibrated_tokens),
+        )[0]
 
-        # ===== Stage2: cross-attention (标准颜色 ← MCS) =====
-        fused_tokens, _ = self.cross_attn(refined_tokens, mcs_tokens, mcs_tokens)
+        # ===== Stage2: cross-attention（标准颜色 ← MCS, Pre-LN + 残差）=====
+        fused_tokens = refined_tokens + self.cross_attn(
+            self.norm_cross_q(refined_tokens),
+            self.norm_cross_kv(mcs_tokens),
+            self.norm_cross_kv(mcs_tokens),
+        )[0]
 
-        # ===== Stage3: CLS聚合 =====
+        # ===== Stage3: CLS聚合（Pre-LN + 残差）=====
         all_tokens = torch.cat([fused_tokens, mcs_tokens], dim=1)
-        cls_out, _ = self.cls_attn(cls_token, all_tokens, all_tokens)
+        cls_out = cls_token + self.cls_attn(
+            self.norm_cls_q(cls_token),
+            self.norm_cls_kv(all_tokens),
+            self.norm_cls_kv(all_tokens),
+        )[0]
 
         # ===== CCM 预测 =====
         ccm_delta = None
@@ -279,14 +305,14 @@ class AWBTransformer(nn.Module):
             ccm_delta = self.ccm_head(cls_out)  # [B, 3, 3]
 
         # ===== CLS调制 =====
-        scale = torch.sigmoid(self.cls_scale(cls_out))  # B,1,C
-        bias = self.cls_bias(cls_out)
-        fused_tokens = fused_tokens * scale + bias
+        cls_s = torch.sigmoid(self.cls_scale(cls_out))  # B,1,C
+        cls_b = self.cls_bias(cls_out)
+        fused_tokens = fused_tokens * cls_s + cls_b
 
         # ===== 输出 spatial AWB gain =====
         gain_map = self.head(fused_tokens)  # B,N,3
         gain_map = gain_map.view(B, self.grid, self.grid, 3)
-        gain_map = F.softplus(gain_map) + 1e-4
+        gain_map = F.softplus(gain_map).clamp(1e-4, 4.0)
 
         # ===== upsample到原图大小 =====
         gain_map = gain_map.permute(0, 3, 1, 2)  # B,3,H,W
