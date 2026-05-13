@@ -10,19 +10,22 @@ from geometry_utils import compute_scene_crop_plan, resize_image, align_mcs_to_f
 
 
 class AWBDataset(Dataset):
-    def __init__(self, root_dir: str, img_size=(128, 128), mcs_size=(128, 128)):
+    def __init__(self, root_dir: str, img_size=(128, 128), mcs_size=(128, 128),
+                 img_dir_name: str = "image_processed", mcs_dir_name: str = "Mcsnpy"):
         self.root = root_dir
         self.img_size = tuple(img_size)
         self.mcs_size = tuple(mcs_size)
 
-        img_dir = os.path.join(root_dir, "image_processed")
-        mcs_dir = os.path.join(root_dir, "Mcsnpy")
+        img_dir = os.path.join(root_dir, img_dir_name)
+        mcs_dir = os.path.join(root_dir, mcs_dir_name)
 
         img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".npz")])
         mcs_files = sorted([f for f in os.listdir(mcs_dir) if f.endswith(".npy")])
 
-        assert len(img_files) % 3 == 0, "dng数量必须是3的倍数"
-        assert len(mcs_files) == len(img_files), "mcs和img数量不匹配"
+        if len(img_files) % 3 != 0:
+            raise ValueError(f"dng数量必须是3的倍数, got {len(img_files)}")
+        if len(mcs_files) != len(img_files):
+            raise ValueError(f"mcs和img数量不匹配: mcs={len(mcs_files)}, img={len(img_files)}")
 
         self.scenes: List[List[Dict[str, Any]]] = []
 
@@ -45,6 +48,7 @@ class AWBDataset(Dataset):
                     "img_name": img_name,
                     "mcs_name": mcs_name,
                     "focal_length": focal_length,
+                    "img_data": img_data,  # 缓存整个img_data，避免重复加载
                 })
 
             # 焦距降序：tele(最大) → main → wide(最小)
@@ -52,10 +56,8 @@ class AWBDataset(Dataset):
 
             scene_samples = []
             for sensor_id, meta in enumerate(scene_meta):
-                img_path = os.path.join(img_dir, meta["img_name"])
                 mcs_path = os.path.join(mcs_dir, meta["mcs_name"])
-
-                img_data = np.load(img_path, allow_pickle=True)
+                img_data = meta["img_data"]  # 使用缓存的数据
                 mcs_data = np.load(mcs_path).astype(np.float32)
 
                 awb_gt_gain = (
@@ -111,7 +113,6 @@ class AWBDataset(Dataset):
         mcs_maps = []
         awb_gt_gain = []
         white_patch_rgb = []
-        crop_boxes = []
         crop_ratios = []
         sensor_ids = []
         scene_ids = []
@@ -120,6 +121,18 @@ class AWBDataset(Dataset):
 
         for sample, plan in zip(scene_samples, crop_plan):
             crop_ratio = plan["crop_ratio"]
+
+            # 校验数据完整性
+            if np.any(np.isnan(sample["image"])) or np.any(np.isinf(sample["image"])):
+                raise ValueError(
+                    f"NaN/Inf in image: scene_id={sample.get('scene_id', '?')}, "
+                    f"file={sample.get('file_name', 'unknown')}"
+                )
+            if np.any(np.isnan(sample["mcs"])) or np.any(np.isinf(sample["mcs"])):
+                raise ValueError(
+                    f"NaN/Inf in MCS: scene_id={sample.get('scene_id', '?')}, "
+                    f"file={sample.get('file_name', 'unknown')}"
+                )
 
             # 图像：仅 resize 不裁剪，保留全视场信息
             image = resize_image(sample["image"], self.img_size, interpolation=cv2.INTER_AREA)
@@ -145,7 +158,6 @@ class AWBDataset(Dataset):
             mcs_maps.append(mcs.astype(np.float32))
             awb_gt_gain.append(gain)
             white_patch_rgb.append(sample["white_patch_rgb"])
-            crop_boxes.append(np.zeros(4, dtype=np.int32))  # 占位，loss 阶段用 crop_ratio 计算
             crop_ratios.append(np.float32(crop_ratio))
             sensor_ids.append(sample["sensor_id"])
             scene_ids.append(sample["scene_id"])
@@ -158,7 +170,6 @@ class AWBDataset(Dataset):
             "mcs": torch.from_numpy(np.stack(mcs_maps, axis=0)),
             "awb_gt_gain": torch.from_numpy(np.stack(awb_gt_gain, axis=0)),
             "white_patch_rgb": torch.from_numpy(np.stack(white_patch_rgb, axis=0)),
-            "crop_box": torch.from_numpy(np.stack(crop_boxes, axis=0)),
             "crop_ratio": torch.from_numpy(np.array(crop_ratios, dtype=np.float32)),
             "sensor_id": torch.from_numpy(np.array(sensor_ids, dtype=np.int64)),
             "scene_id": torch.from_numpy(np.array(scene_ids, dtype=np.int64)),

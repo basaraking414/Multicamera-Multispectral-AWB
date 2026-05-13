@@ -2,6 +2,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import cv2
 import numpy as np
+import torch
 
 
 def focal_to_crop_ratio(focal_length: float, reference_focal: float) -> float:
@@ -143,3 +144,43 @@ def align_mcs_to_fov(
     confidence = np.clip(confidence, 0.0, 1.0)
 
     return aligned, confidence
+
+
+# =============================================================================
+# 可视化辅助工具
+# =============================================================================
+def ensure_float01(image: np.ndarray) -> np.ndarray:
+    """归一化图像到 [0, 1]，适配 8-bit/16-bit 输入。"""
+    image = image.astype(np.float32)
+    if image.max() > 1.0:
+        image = image / image.max()
+    return np.clip(image, 0.0, 1.0)
+
+
+def auto_expose(image: np.ndarray, percentile: float = 99.5) -> np.ndarray:
+    """自动曝光显示：P99.5 归一化 + gamma 2.2 暗部补偿。仅用于可视化。"""
+    image = ensure_float01(image)
+    scale = np.percentile(image, percentile)
+    scale = max(float(scale), 1e-4)
+    image = np.clip(image / scale, 0.0, 1.0)
+    image = np.power(image, 1.0 / 2.2)
+    return np.clip(image, 0.0, 1.0)
+
+
+# =============================================================================
+# CCM 矩阵工具
+# =============================================================================
+def safe_inv_ccm(ccm: torch.Tensor, eps_factor: float = 10.0) -> torch.Tensor:
+    """数值稳定的CCM矩阵求逆。
+
+    通过 eps * eye(3) 正则化避免奇异矩阵求逆导致的 NaN/Inf。
+
+    Args:
+        ccm:        [B, 3, 3] 色彩校正矩阵
+        eps_factor: 正则化系数，eps = max(1e-6, finfo.eps * eps_factor)
+    Returns:
+        ccm_inv:    [B, 3, 3] 逆矩阵
+    """
+    eps = max(1e-6, torch.finfo(ccm.dtype).eps * eps_factor)
+    eye = torch.eye(3, device=ccm.device, dtype=ccm.dtype).unsqueeze(0)
+    return torch.linalg.inv(ccm.float() + eps * eye)

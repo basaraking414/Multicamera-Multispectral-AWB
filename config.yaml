@@ -29,8 +29,8 @@ data:
   debug_mcs_dir: "Mcsnpy/debug_mcs"
 
   # 通用参数
-  img_size: [128, 128]
-  mcs_size: [128, 128]
+  img_size: [64, 64]
+  mcs_size: [64, 64]
   raw_extensions: [".dng", ".nef", ".arw"]
 
 # ---------------------------------------------------------------------------
@@ -58,6 +58,7 @@ training:
   epochs: 100
   scene_batch_size: 1
   learning_rate: 0.0001
+  num_workers: 0  # DataLoader 工作进程数，0=主进程加载，Windows建议0-4
 
   lr_scheduler: "cosine"       # "cosine" | "plateau" | "none"
   lr_scheduler_params:
@@ -73,8 +74,10 @@ training:
     awb: 1.0
     reconstruction: 10.0
     consistency: 2.0
+    srgb: 1.0  # sRGB损失权重，需同时设置 model.predict_ccm: true
 
-  loss_crop_size: 64            # 后裁剪统一尺寸（全视场模式下裁剪重叠区算 loss）
+  loss_crop_size: 32            # 后裁剪统一尺寸（全视场模式下裁剪重叠区算 loss）
+  smoothness_weight: 0.05       # 空间平滑损失权重，0 则关闭
 
 # ---------------------------------------------------------------------------
 # Checkpoint
@@ -94,6 +97,18 @@ debug:
   save_interval: 5             # 每隔 N 个 epoch 保存 debug 图像
 
 # ---------------------------------------------------------------------------
+# 测试
+# ---------------------------------------------------------------------------
+test:
+  root_dir: "./data"                  # 测试集根目录（与训练数据相同结构：image_processed/ + Mcsnpy/）
+  checkpoint: "./checkpoints/best_model.pth"  # 测试用的模型权重
+  batch_size: 1
+  output_dir: "./debug_outputs/test_outputs"
+  img_size: [64, 64]
+  mcs_size: [64, 64]
+  loss_crop_size: 32                       # 后裁剪尺寸（默认与 training.loss_crop_size 一致）
+
+# ---------------------------------------------------------------------------
 # 推理
 # ---------------------------------------------------------------------------
 inference:
@@ -101,5 +116,5 @@ inference:
   output_dir: "./inference_outputs"
   save_gain_map: true
   save_corrected_image: true
-  img_size: [128, 128]
-  mcs_size: [128, 128]
+  img_size: [64, 64]
+  mcs_size: [64, 64]

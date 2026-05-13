@@ -26,8 +26,8 @@ class DataConfig:
     image_processed_dir: str = "image_processed"
     debug_white_patch_dir: str = "image_processed/debug_white_patch"
     debug_mcs_dir: str = "Mcsnpy/debug_mcs"
-    img_size: Tuple[int, int] = (128, 128)
-    mcs_size: Tuple[int, int] = (128, 128)
+    img_size: Tuple[int, int] = (64, 64)
+    mcs_size: Tuple[int, int] = (64, 64)
     raw_extensions: List[str] = field(default_factory=lambda: [".dng", ".nef", ".arw"])
 
 
@@ -43,8 +43,8 @@ class ModelConfig:
     num_heads: int = 4
     grid_size: int = 16
     use_positional_encoding: bool = True
-    sensor_embed_dim: int = 16
-    predict_ccm: bool = False
+    focal_embed_dim: int = 16
+    predict_ccm: bool = True
 
 
 @dataclass
@@ -57,7 +57,9 @@ class TrainingConfig:
     loss_weights: Dict[str, float] = field(default_factory=lambda: {
         "awb": 1.0, "reconstruction": 10.0, "consistency": 2.0,
     })
-    loss_crop_size: int = 64
+    loss_crop_size: int = 32
+    smoothness_weight: float = 0.0
+    num_workers: int = 0  # DataLoader 工作进程数，0=主进程加载
 
 
 @dataclass
@@ -76,13 +78,24 @@ class DebugConfig:
 
 
 @dataclass
+class TestConfig:
+    root_dir: str = "./test_data"
+    checkpoint: str = "./checkpoints/best_model.pth"
+    batch_size: int = 1
+    output_dir: str = "./test_outputs"
+    img_size: Tuple[int, int] = (64, 64)
+    mcs_size: Tuple[int, int] = (64, 64)
+    loss_crop_size: int = 32
+
+
+@dataclass
 class InferenceConfig:
     checkpoint: str = "./checkpoints/best_model.pth"
     output_dir: str = "./inference_outputs"
     save_gain_map: bool = True
     save_corrected_image: bool = True
-    img_size: Tuple[int, int] = (128, 128)
-    mcs_size: Tuple[int, int] = (128, 128)
+    img_size: Tuple[int, int] = (64, 64)
+    mcs_size: Tuple[int, int] = (64, 64)
 
 
 @dataclass
@@ -100,6 +113,7 @@ class Config:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    test: TestConfig = field(default_factory=TestConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
 
 
@@ -112,6 +126,18 @@ def _resolve_path(base_dir: str, value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     return os.path.normpath(os.path.join(base_dir, value))
+
+
+def _parse_size(value, name: str) -> Tuple[int, int]:
+    """解析尺寸配置，确保返回 (H, W) 二元组。"""
+    if isinstance(value, (int, float)):
+        return (int(value), int(value))
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            return (int(value[0]), int(value[0]))
+        if len(value) == 2:
+            return (int(value[0]), int(value[1]))
+    raise ValueError(f"{name} must be [H, W] or a single int, got: {value}")
 
 
 def load_config(config_path: str = "config.yaml") -> Config:
@@ -141,8 +167,8 @@ def load_config(config_path: str = "config.yaml") -> Config:
         image_processed_dir=d.get("image_processed_dir", "image_processed"),
         debug_white_patch_dir=d.get("debug_white_patch_dir", "image_processed/debug_white_patch"),
         debug_mcs_dir=d.get("debug_mcs_dir", "Mcsnpy/debug_mcs"),
-        img_size=tuple(d.get("img_size", [128, 128])),
-        mcs_size=tuple(d.get("mcs_size", [128, 128])),
+        img_size=_parse_size(d.get("img_size", [64, 64]), "data.img_size"),
+        mcs_size=_parse_size(d.get("mcs_size", [64, 64]), "data.mcs_size"),
         raw_extensions=d.get("raw_extensions", [".dng", ".nef", ".arw"]),
     )
 
@@ -161,8 +187,8 @@ def load_config(config_path: str = "config.yaml") -> Config:
         num_heads=m.get("num_heads", 4),
         grid_size=m.get("grid_size", 16),
         use_positional_encoding=m.get("use_positional_encoding", True),
-        sensor_embed_dim=m.get("sensor_embed_dim", 16),
-        predict_ccm=m.get("predict_ccm", False),
+        focal_embed_dim=m.get("focal_embed_dim", 16),
+        predict_ccm=m.get("predict_ccm", True),
     )
 
     # ---- training ----
@@ -174,7 +200,9 @@ def load_config(config_path: str = "config.yaml") -> Config:
         lr_scheduler=t.get("lr_scheduler", "cosine"),
         lr_scheduler_params=t.get("lr_scheduler_params", {}),
         loss_weights=t.get("loss_weights", {"awb": 1.0, "reconstruction": 10.0, "consistency": 2.0}),
-        loss_crop_size=t.get("loss_crop_size", 64),
+        loss_crop_size=t.get("loss_crop_size", 32),
+        smoothness_weight=t.get("smoothness_weight", 0.0),
+        num_workers=t.get("num_workers", 0),
     )
 
     # ---- checkpoint ----
@@ -194,6 +222,18 @@ def load_config(config_path: str = "config.yaml") -> Config:
         save_interval=dbg.get("save_interval", 5),
     )
 
+    # ---- test ----
+    tst = raw.get("test", {})
+    test = TestConfig(
+        root_dir=_resolve_path(base_dir, tst.get("root_dir", "./test_data")),
+        checkpoint=_resolve_path(base_dir, tst.get("checkpoint", "./checkpoints/best_model.pth")),
+        batch_size=tst.get("batch_size", 1),
+        output_dir=_resolve_path(base_dir, tst.get("output_dir", "./test_outputs")),
+        img_size=_parse_size(tst.get("img_size", [64, 64]), "test.img_size"),
+        mcs_size=_parse_size(tst.get("mcs_size", [64, 64]), "test.mcs_size"),
+        loss_crop_size=tst.get("loss_crop_size", 32),
+    )
+
     # ---- inference ----
     inf = raw.get("inference", {})
     inference = InferenceConfig(
@@ -201,8 +241,8 @@ def load_config(config_path: str = "config.yaml") -> Config:
         output_dir=_resolve_path(base_dir, inf.get("output_dir", "./inference_outputs")),
         save_gain_map=inf.get("save_gain_map", True),
         save_corrected_image=inf.get("save_corrected_image", True),
-        img_size=tuple(inf.get("img_size", [128, 128])),
-        mcs_size=tuple(inf.get("mcs_size", [128, 128])),
+        img_size=_parse_size(inf.get("img_size", [64, 64]), "inference.img_size"),
+        mcs_size=_parse_size(inf.get("mcs_size", [64, 64]), "inference.mcs_size"),
     )
 
     return Config(
@@ -213,6 +253,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
         training=training,
         checkpoint=checkpoint,
         debug=debug,
+        test=test,
         inference=inference,
     )
 
@@ -227,9 +268,13 @@ def build_lr_scheduler(
 
     if name == "cosine":
         from torch.optim.lr_scheduler import CosineAnnealingLR
+        # T_max 默认与 epochs 一致，避免学习率在训练后期回升
+        t_max = params.get("T_max", cfg.epochs)
+        if t_max > cfg.epochs:
+            t_max = cfg.epochs
         return CosineAnnealingLR(
             optimizer,
-            T_max=params.get("T_max", cfg.epochs),
+            T_max=t_max,
             eta_min=params.get("eta_min", 1e-6),
         )
     elif name == "plateau":

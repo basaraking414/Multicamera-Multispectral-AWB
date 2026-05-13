@@ -18,8 +18,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config_loader import load_config
-from geometry_utils import align_mcs_to_fov
-from gt_utils import _auto_expose, _ensure_float01
+from geometry_utils import align_mcs_to_fov, auto_expose, ensure_float01
 from model import AWBTransformer
 
 
@@ -32,7 +31,7 @@ def load_model(cfg, device: torch.device) -> AWBTransformer:
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     model_cfg = ckpt.get("config", {})
 
     model = AWBTransformer(
@@ -40,6 +39,7 @@ def load_model(cfg, device: torch.device) -> AWBTransformer:
         num_heads=model_cfg.get("num_heads", cfg.model.num_heads),
         grid_size=model_cfg.get("grid_size", cfg.model.grid_size),
         use_positional_encoding=model_cfg.get("use_positional_encoding", cfg.model.use_positional_encoding),
+        focal_embed_dim=model_cfg.get("focal_embed_dim", 16),
         predict_ccm=model_cfg.get("predict_ccm", False),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -70,12 +70,7 @@ def load_single_sample(npz_path: str, npy_path: str, img_size, mcs_size,
     # 缩放后的图像（供模型推理）
     image_resized = cv2.resize(image_orig, img_size[::-1], interpolation=cv2.INTER_AREA)
 
-    # MCS 缩放
-    mcs_tensor = torch.from_numpy(mcs_data).permute(2, 0, 1).unsqueeze(0)
-    mcs_tensor = F.interpolate(mcs_tensor, size=mcs_size, mode='area')
-    mcs = mcs_tensor[0].permute(1, 2, 0).numpy().astype(np.float32)
-
-    # MCS 空间对齐（与训练时 dataloader 行为一致）
+    # MCS 空间对齐（与训练时 dataloader 行为一致，align_mcs_to_fov 内部会 resize）
     focal_length = float(
         img_data["focal_length_35mm"]
         if "focal_length_35mm" in img_data
@@ -83,9 +78,9 @@ def load_single_sample(npz_path: str, npy_path: str, img_size, mcs_size,
     )
     if ref_focal is not None and ref_focal > 0:
         align_ratio = ref_focal / max(focal_length, 1e-4)
-        mcs_aligned, confidence = align_mcs_to_fov(mcs, align_ratio, mcs_size)
+        mcs_aligned, confidence = align_mcs_to_fov(mcs_data, align_ratio, mcs_size)
     else:
-        mcs_aligned, confidence = mcs, np.ones(mcs.shape[:2], dtype=np.float32)
+        mcs_aligned, confidence = mcs_data, np.ones(mcs_data.shape[:2], dtype=np.float32)
     mcs = np.concatenate([mcs_aligned, confidence[..., None]], axis=-1).astype(np.float32)
 
     ccm1 = img_data["xyz2camera_rgb1"].astype(np.float32)
@@ -154,23 +149,23 @@ def save_results(
         gain_vis_bgr = cv2.cvtColor(gain_vis, cv2.COLOR_RGB2BGR)
         cv2.imwrite(os.path.join(output_dir, f"{base_name}_gain_map.png"), gain_vis_bgr)
 
-    # ===== 校正后图像 =====
-    if cfg.inference.save_corrected_image:
-        corrected = np.clip(image * gain_map, 0.0, 1.0)
-        corrected_display = _auto_expose(corrected)
-        corrected_bgr = (corrected_display[..., ::-1] * 255).astype(np.uint8)
-        cv2.imwrite(os.path.join(output_dir, f"{base_name}_corrected.png"), corrected_bgr)
-
-    # ===== 输入图像（对比）=====
-    input_display = _auto_expose(image)
+    # ===== 输入图像 =====
+    input_display = auto_expose(image)
     input_bgr = (input_display[..., ::-1] * 255).astype(np.uint8)
     cv2.imwrite(os.path.join(output_dir, f"{base_name}_input.png"), input_bgr)
 
-    # ===== 拼接对比图 =====
-    panel = np.concatenate([input_bgr, corrected_bgr], axis=1)
-    cv2.putText(panel, "input", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(panel, "AWB corrected", (panel.shape[1] // 2 + 8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_comparison.png"), panel)
+    # ===== 校正后图像 + 对比图 =====
+    if cfg.inference.save_corrected_image:
+        corrected = np.clip(image * gain_map, 0.0, 1.0)
+        corrected_display = auto_expose(corrected)
+        corrected_bgr = (corrected_display[..., ::-1] * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(output_dir, f"{base_name}_corrected.png"), corrected_bgr)
+
+        # 拼接对比图
+        panel = np.concatenate([input_bgr, corrected_bgr], axis=1)
+        cv2.putText(panel, "input", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(panel, "AWB corrected", (panel.shape[1] // 2 + 8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.imwrite(os.path.join(output_dir, f"{base_name}_comparison.png"), panel)
 
     print(f"  [Saved] {base_name} -> {output_dir}")
 
