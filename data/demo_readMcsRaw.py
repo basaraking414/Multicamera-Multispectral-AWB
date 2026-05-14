@@ -79,7 +79,7 @@ if __name__ == "__main__":
         # MCS 旋转校正：使 MCS 坐标系与 raw 图像坐标系一致
         if MCS_ROT90_K != 0:
             output_channels = np.rot90(output_channels, k=MCS_ROT90_K)
-            print(f"  Rotated MCS by k={MCS_ROT90_K} (shape: {output_channels.shape})")
+            # print(f"  Rotated MCS by k={MCS_ROT90_K} (shape: {output_channels.shape})")
 
         base_name = os.path.splitext(name)[0]
         output_file = os.path.join(mcs_dir, f"{base_name}.npy")

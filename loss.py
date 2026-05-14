@@ -2,15 +2,9 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
+import math
 
-from geometry_utils import safe_inv_ccm
-
-# CIE标准XYZ到sRGB转换矩阵(D65光源)
-XYZ_TO_SRGB = torch.tensor([
-    [3.2406, -1.5372, -0.4986],
-    [-0.9689, 1.8758, 0.0415],
-    [0.0557, -0.2040, 1.0570],
-], dtype=torch.float32)
+from geometry_utils import safe_inv_ccm, srgb_gamma, XYZ_TO_SRGB
 
 
 # =============================================================================
@@ -55,34 +49,27 @@ def crop_to_overlap(
 
 
 # =============================================================================
-# sRGB Gamma 校正
-# =============================================================================
-def srgb_gamma(linear: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """线性光 → sRGB gamma 校正（标准 sRGB 分段曲线）。"""
-    mask = linear <= 0.0031308
-    srgb = torch.where(
-        mask,
-        12.92 * linear,
-        1.055 * torch.clamp(linear, min=eps).pow(1.0 / 2.4) - 0.055,
-    )
-    return torch.clamp(srgb, 0.0, 1.0)
-
-
-# =============================================================================
 # 损失函数
 # =============================================================================
 def angular_loss(pred_gain: torch.Tensor, gt_gain: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """逐像素角度损失：对每个像素计算 gain 方向误差，再空间平均。
+    """逐像素角度损失：使用 atan2 计算稳定的角度误差（弧度）。
 
     gt_gain [B*S, 3] 通过广播与 pred_gain [B*S, H, W, 3] 逐像素比较。
     """
     pred_vec = F.normalize(pred_gain, dim=-1, eps=eps)
     gt_vec = F.normalize(gt_gain, dim=-1, eps=eps)
-    # 将 gt_vec reshape 为 [B*S, 1, 1, 3] 以便与 pred_vec [B*S, H, W, 3] 广播
+    # gt_vec: [B*S, 3] → [B*S, 1, 1, 3] 广播到 pred_vec 形状
     if gt_vec.dim() == 2:
         gt_vec = gt_vec.unsqueeze(1).unsqueeze(1)
-    cosine = torch.clamp((pred_vec * gt_vec).sum(dim=-1), -1.0 + eps, 1.0 - eps)
-    return (1.0 - cosine).mean()
+    # 扩展 gt_vec 到 pred_vec 形状以计算 cross product
+    gt_expanded = gt_vec.expand_as(pred_vec)
+    # atan2 计算角度：cross 的模 / dot
+    cross = torch.cross(pred_vec, gt_expanded, dim=-1)
+    cross_norm = cross.norm(dim=-1)
+    dot = (pred_vec * gt_expanded).sum(dim=-1)
+    angle = torch.atan2(cross_norm, dot)  # [0, π]
+    angle_deg = angle * (180.0 / math.pi)  # 转换为度
+    return angle_deg.mean()
 
 
 def reconstruction_loss(pred_image: torch.Tensor, gt_image: torch.Tensor) -> torch.Tensor:
@@ -91,21 +78,38 @@ def reconstruction_loss(pred_image: torch.Tensor, gt_image: torch.Tensor) -> tor
 
 def scene_consistency_loss(pred_image: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
-    pred_image: [B, S, H, W, 3]
-    约束同场景内三摄的白平衡结果色度一致。
+    pred_image: [B, S, H, W, 3] 线性RGB空间
+    在 Lab 空间的 a,b 通道计算色度一致性，约束同场景三摄色度一致。
+    使用欧氏距离衡量色度差异。
     """
-    scene_mean_rgb = pred_image.mean(dim=(2, 3))
-    chroma = scene_mean_rgb / torch.clamp(scene_mean_rgb.sum(dim=-1, keepdim=True), min=eps)
-    scene_center = chroma.mean(dim=1, keepdim=True)
-    return torch.mean(torch.abs(chroma - scene_center))
+    from geometry_utils import linear_rgb_to_lab
+
+    # 转换到 Lab 空间
+    lab = linear_rgb_to_lab(pred_image, eps=eps)  # [B, S, H, W, 3]
+    # 只取 a,b 通道（色度），忽略亮度 L
+    ab = lab[..., 1:]  # [B, S, H, W, 2]
+    # 计算每个 sensor 的空间均值
+    sensor_mean_ab = ab.mean(dim=(2, 3))  # [B, S, 2]
+    # 场景中心（三摄均值）
+    scene_center = sensor_mean_ab.mean(dim=1, keepdim=True)  # [B, 1, 2]
+    # 欧氏距离：sqrt((a_i - a_center)^2 + (b_i - b_center)^2)
+    return torch.mean(torch.norm(sensor_mean_ab - scene_center, dim=-1))
 
 
 def srgb_loss(
     pred_srgb: torch.Tensor,
     gt_srgb: torch.Tensor,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
-    """在 sRGB 空间中的图像重建损失。"""
-    return F.l1_loss(pred_srgb, gt_srgb)
+    """CIE76 Lab 色差损失。"""
+    from geometry_utils import srgb_to_lab
+
+    pred_lab = srgb_to_lab(pred_srgb, eps=eps)
+    gt_lab = srgb_to_lab(gt_srgb, eps=eps)
+    # CIE76: 欧氏距离
+    delta = pred_lab - gt_lab
+    delta_e = torch.sqrt(torch.sum(delta ** 2, dim=-1) + eps)
+    return delta_e.mean()
 
 
 def spatial_smoothness_loss(

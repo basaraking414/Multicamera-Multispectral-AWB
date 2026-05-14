@@ -1,33 +1,31 @@
 """
 独立的 AWB Ground Truth 提取模块
 =================================
-与 DNG 解码完全解耦，可独立运行在任意 RAW NPZ 上。
-
-提供两种 GT 获取方法:
-  1. colorchecker — 自动/半自动检测 X-Rite ColorChecker 灰阶块，获得准确 AWB 增益
-  2. white_patch  — 启发式白块检测，适用于无色彩场景
+手动框选色卡灰阶行（6 个灰阶块），计算 AWB 增益。
 
 使用方式:
-  # 批量处理（自动检测色卡）
-  python gt_extractor.py --input_dir ../image_raw --output_dir ../image_processed --method colorchecker
+  # 默认：弹出窗口手动框选灰阶行
+  python gt_extractor.py --input_dir ../image_raw --output_dir ../image_processed
 
-  # 带 ROI 的手动色卡模式（ROI格式: x0,y0,x1,y1）
-  python gt_extractor.py --input_dir ../image_raw --output_dir ../image_processed --method colorchecker --roi "100,200,400,500"
-
-  # 启发式白块模式
-  python gt_extractor.py --input_dir ../image_raw --output_dir ../image_processed --method white_patch
+  # 指定灰阶行 ROI（跳过手动框选，适合批量处理）
+  python gt_extractor.py --input_dir ../image_raw --output_dir ../image_processed --roi "100,200,400,500"
 """
 
 import argparse
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 
+# 灰阶行采样参数
+NUM_GRAY_PATCHES = 6       # PMCC 和 X-Rite 灰阶行都是 6 列
+MARGIN_H = 0.30            # 水平采样边距（每列中心 30% 区域）
+MARGIN_V = 0.15            # 垂直采样边距（灰阶行窄，用小值避免溢出）
+
 
 # ==============================================================================
-# 色彩工具
+# 工具函数
 # ==============================================================================
 
 def _ensure_float01(image: np.ndarray) -> np.ndarray:
@@ -47,254 +45,187 @@ def _auto_expose(image: np.ndarray, percentile: float = 99.5) -> np.ndarray:
 
 
 # ==============================================================================
-# 方法 A：X-Rite ColorChecker 灰阶块检测（推荐）
+# 灰阶块提取
 # ==============================================================================
-# ColorChecker Classic 布局：4行×6列
-# 第4行（最下面一行）为6个灰阶块：白→灰→黑（亮度递减）
-# row_indices: 0=行1, 1=行2, 2=行3, 3=行4(灰阶行)
-#
-# 物理尺寸 ≈ 216mm × 140mm → 宽高比 ≈ 1.543
 
-COLORCHECKER_GRID = (4, 6)
-COLORCHECKER_ASPECT = 216.0 / 140.0  # ≈ 1.543
-COLORCHECKER_ASPECT_TOLERANCE = 0.3
-GRAY_ROW_INDEX = 3  # 0-indexed，第4行
-
-
-def _order_corners(pts: np.ndarray) -> np.ndarray:
-    """将四个角点排序为：左上、右上、右下、左下"""
-    rect = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]   # 左上（和最小）
-    rect[2] = pts[np.argmax(s)]   # 右下（和最大）
-    d = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(d)]   # 右上（差最小）
-    rect[3] = pts[np.argmax(d)]   # 左下（差最大）
-    return rect
-
-
-def detect_colorchecker_auto(image: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """
-    自动检测图中的 X-Rite ColorChecker。
-
-    返回:
-        (gray_patch_rgbs, patch_centers)
-        gray_patch_rgbs: [6, 3] 灰阶块 RGB
-        patch_centers:   [6, 2] 灰阶块中心坐标
-    如果未检测到，返回 None。
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    h, w = image.shape[:2]
-
-    # 多尺度边缘检测
-    edges = cv2.Canny((gray * 255).astype(np.uint8), 30, 100)
-
-    # 寻找四边形轮廓
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
-
-    for cnt in contours:
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
-        if len(approx) != 4:
-            continue
-
-        area = cv2.contourArea(approx)
-        if area < h * w * 0.01:  # 至少占图像 1%
-            continue
-
-        pts = approx.reshape(4, 2).astype(np.float32)
-        rect = _order_corners(pts)
-
-        # 计算宽高比
-        dx = rect[1] - rect[0]
-        dy = rect[3] - rect[0]
-        aspect = np.linalg.norm(dx) / max(np.linalg.norm(dy), 1e-4)
-
-        if not (COLORCHECKER_ASPECT * (1 - COLORCHECKER_ASPECT_TOLERANCE) <= aspect <=
-                COLORCHECKER_ASPECT * (1 + COLORCHECKER_ASPECT_TOLERANCE)):
-            continue
-
-        candidates.append((area, rect, aspect))
-
-    if not candidates:
-        return None
-
-    # 取面积最大的候选
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    _, best_rect, _ = candidates[0]
-
-    # 透视变换，获得正面视图
-    dst_w, dst_h = 600, int(600 / COLORCHECKER_ASPECT)
-    dst_pts = np.array([[0, 0], [dst_w, 0], [dst_w, dst_h], [0, dst_h]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(best_rect, dst_pts)
-    warped = cv2.warpPerspective(image, M, (dst_w, dst_h))
-
-    # 4×6 网格分割
-    cell_w = dst_w / COLORCHECKER_GRID[1]
-    cell_h = dst_h / COLORCHECKER_GRID[0]
-
-    gray_patches = []
-    gray_centers_img = []
-
-    for col in range(COLORCHECKER_GRID[1]):
-        cx = int(col * cell_w + cell_w / 2)
-        cy = int(GRAY_ROW_INDEX * cell_h + cell_h / 2)
-
-        # 在 warped 图中的网格中心采样一个小块
-        margin = 0.3
-        x1 = max(0, int(cx - cell_w * margin / 2))
-        x2 = min(dst_w, int(cx + cell_w * margin / 2))
-        y1 = max(0, int(cy - cell_h * margin / 2))
-        y2 = min(dst_h, int(cy + cell_h * margin / 2))
-        patch = warped[y1:y2, x1:x2]
-        patch_rgb = patch.reshape(-1, 3).mean(axis=0)
-
-        gray_patches.append(patch_rgb)
-
-        # 将中心坐标映射回原图
-        src_pt = cv2.perspectiveTransform(
-            np.array([[[cx, cy]]], dtype=np.float32), cv2.getPerspectiveTransform(dst_pts, best_rect)
-        )
-        gray_centers_img.append(src_pt[0, 0])
-
-    gray_patches = np.array(gray_patches, dtype=np.float32)
-    gray_centers_img = np.array(gray_centers_img, dtype=np.float32)
-
-    return gray_patches, gray_centers_img
-
-
-def detect_colorchecker_roi(
+def detect_gray_row_patches(
     image: np.ndarray,
     roi: Tuple[int, int, int, int],
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    给定 ROI（x0, y0, x1, y1），提取色卡的灰阶块。
-    将 ROI 区域划分为 4×6 网格，取最后一行作为灰阶块。
+    从灰阶行 ROI 中提取 6 个灰阶块。
+    将 ROI 水平等分为 6 列，每列中心采样。
+
+    参数:
+        image: RGB 图像 [H, W, 3]
+        roi: (x0, y0, x1, y1) 灰阶行区域
 
     返回:
-        gray_patch_rgbs: [6, 3]
-        patch_centers:   [6, 2]
+        gray_patches: [6, 3]  每个灰阶块的 RGB 均值
+        patch_centers: [6, 2] 中心坐标（全图坐标）
+        patch_bboxes: [6, 4] 每个灰阶块的 bbox (x0,y0,x1,y1)
     """
     x0, y0, x1, y1 = roi
     roi_img = image[y0:y1, x0:x1]
     rh, rw = roi_img.shape[:2]
 
-    cell_w = rw / COLORCHECKER_GRID[1]
-    cell_h = rh / COLORCHECKER_GRID[0]
-    margin = 0.3
+    if rw < 60:
+        print(f"  [WARN] ROI 宽度 {rw}px 偏窄，采样可能不准确")
+
+    cell_w = rw / NUM_GRAY_PATCHES
 
     gray_patches = []
     gray_centers = []
+    gray_bboxes = []
 
-    for col in range(COLORCHECKER_GRID[1]):
+    for col in range(NUM_GRAY_PATCHES):
         cx = int(col * cell_w + cell_w / 2)
-        cy = int(GRAY_ROW_INDEX * cell_h + cell_h / 2)
+        cy = rh // 2
 
-        px1 = max(0, int(cx - cell_w * margin / 2))
-        px2 = min(rw, int(cx + cell_w * margin / 2))
-        py1 = max(0, int(cy - cell_h * margin / 2))
-        py2 = min(rh, int(cy + cell_h * margin / 2))
+        px1 = max(0, int(cx - cell_w * MARGIN_H / 2))
+        px2 = min(rw, int(cx + cell_w * MARGIN_H / 2))
+        py1 = max(0, int(cy - rh * MARGIN_V / 2))
+        py2 = min(rh, int(cy + rh * MARGIN_V / 2))
 
         patch = roi_img[py1:py2, px1:px2]
-        patch_rgb = patch.reshape(-1, 3).mean(axis=0)
-
-        gray_patches.append(patch_rgb)
+        gray_patches.append(patch.reshape(-1, 3).mean(axis=0))
         gray_centers.append([x0 + cx, y0 + cy])
+        gray_bboxes.append([x0 + px1, y0 + py1, x0 + px2, y0 + py2])
 
-    return np.array(gray_patches, dtype=np.float32), np.array(gray_centers, dtype=np.float32)
+    patches_arr = np.array(gray_patches, dtype=np.float32)
+
+    # 验证：灰阶行亮度应单调递减（白→黑）
+    lum = patches_arr.mean(axis=1)
+    if int(np.sum(np.diff(lum) < 0)) < 4:
+        print(f"  [WARN] 灰阶行亮度非单调递减，框选可能不准确")
+
+    return (
+        patches_arr,
+        np.array(gray_centers, dtype=np.float32),
+        np.array(gray_bboxes, dtype=np.int32),
+    )
 
 
-def compute_gain_from_gray_patches(gray_patches: np.ndarray) -> np.ndarray:
+def compute_gain_from_gray_patches(gray_patches: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     从灰阶块 RGB 值计算 AWB 增益。
-    输入: gray_patches [6, 3] — 6个灰阶块的RGB均值（从白到黑）
+    排除最亮（可能过曝）和最暗（低信噪比）的块。
 
-    策略：使用最亮且未饱和的灰阶块（通常是第1-3个）来计算。
-    因为最暗的灰块信噪比低，最亮的白块可能过曝。
+    返回:
+        gain: (3,) AWB 增益 [R_gain, 1.0, B_gain]
+        used_indices: (M,) 实际使用的灰阶块索引
     """
     gray_patches = np.clip(gray_patches, 1e-4, None)
-    luminance = gray_patches.mean(axis=1)
-
-    # 排除最亮（可能过曝）和最暗（低信噪比）的块
-    used_indices = [1, 2, 3, 4] if len(gray_patches) >= 5 else range(len(gray_patches))
+    used_indices = [1, 2, 3, 4] if len(gray_patches) >= 5 else list(range(len(gray_patches)))
     used = gray_patches[used_indices]
-
-    # 平均多个灰块提高鲁棒性
     mean_rgb = used.mean(axis=0)
     gain = np.array(
         [mean_rgb[1] / mean_rgb[0], 1.0, mean_rgb[1] / mean_rgb[2]],
         dtype=np.float32,
     )
-    return np.clip(gain, 0.25, 4.0)
+    return np.clip(gain, 0.25, 4.0), np.array(used_indices, dtype=np.int32)
 
 
 # ==============================================================================
-# 方法 B：启发式白块检测（从 gt_utils 移植，独立版本）
+# 手动框选
 # ==============================================================================
 
-def _window_mean(map_2d: np.ndarray, window_hw: Tuple[int, int]) -> np.ndarray:
-    kernel = np.ones(window_hw, dtype=np.float32)
-    summed = cv2.filter2D(map_2d, -1, kernel, borderType=cv2.BORDER_REFLECT)
-    return summed / float(window_hw[0] * window_hw[1])
-
-
-def detect_white_patch(
+def _manual_select_roi(
     image: np.ndarray,
-    patch_fraction: float = 0.1,
-) -> Tuple[Tuple[int, int, int, int], np.ndarray, Dict[str, float]]:
+    window_title: str = "Select Gray Row",
+) -> Optional[Tuple[int, int, int, int]]:
     """
-    检测图像中最亮的低饱和度区域作为白块近似。
-    适用于包含白色/中性色块的场景。
-
-    返回:
-        bbox: (x0, y0, x1, y1)
-        white_patch_rgb: (3,) — 白块区域 RGB 均值
-        diagnostics: 调试信息
+    弹出窗口让用户手动框选灰阶行，支持鼠标滚轮放大。
+    操作：滚轮=缩放, 右键拖拽=平移, 左键拖拽=框选, 中键=重置缩放, SPACE=确认, ESC=取消
     """
-    image = _ensure_float01(image)
-    h, w, _ = image.shape
+    preview = _auto_expose(image)
+    display_img = (preview[..., ::-1] * 255).astype(np.uint8)  # RGB -> BGR
 
-    patch_h = max(12, int(h * patch_fraction))
-    patch_w = max(12, int(w * patch_fraction))
+    h, w = display_img.shape[:2]
+    WIN_W, WIN_H = 1200, 800
+    init_scale = min(WIN_W / w, WIN_H / h, 1.0)
 
-    max_rgb = image.max(axis=2)
-    min_rgb = image.min(axis=2)
-    luminance = 0.2126 * image[..., 0] + 0.7152 * image[..., 1] + 0.0722 * image[..., 2]
-    saturation = (max_rgb - min_rgb) / np.clip(max_rgb, 1e-4, None)
-
-    bright_score = luminance / np.clip(np.percentile(luminance, 98), 1e-4, None)
-    neutral_score = 1.0 - np.clip(saturation / max(np.percentile(saturation, 75), 1e-4), 0.0, 1.0)
-
-    clipped_penalty = (max_rgb > 0.98).astype(np.float32) * 0.35
-    score = bright_score * 0.7 + neutral_score * 0.3 - clipped_penalty
-    score = cv2.GaussianBlur(score, (0, 0), sigmaX=3.0)
-
-    score_mean = _window_mean(score, (patch_h, patch_w))
-    peak_y, peak_x = np.unravel_index(np.argmax(score_mean), score_mean.shape)
-
-    y0 = int(np.clip(peak_y - patch_h // 2, 0, h - patch_h))
-    x0 = int(np.clip(peak_x - patch_w // 2, 0, w - patch_w))
-    y1 = y0 + patch_h
-    x1 = x0 + patch_w
-
-    patch = image[y0:y1, x0:x1]
-    white_patch_rgb = patch.reshape(-1, 3).mean(axis=0)
-    diagnostics = {
-        "score_max": float(score_mean.max()),
-        "score_min": float(score_mean.min()),
-        "patch_fraction": float(patch_fraction),
+    # 状态
+    state = {
+        'scale': init_scale, 'pan_x': 0.0, 'pan_y': 0.0,
+        'roi_start': None, 'roi_end': None, 'drawing': False, 'pan_ref': None,
     }
-    return (x0, y0, x1, y1), white_patch_rgb.astype(np.float32), diagnostics
 
+    def to_orig(dx, dy):
+        return state['pan_x'] + dx / state['scale'], state['pan_y'] + dy / state['scale']
 
-def compute_awb_gain(white_patch_rgb: np.ndarray) -> np.ndarray:
-    """从白块 RGB 计算 AWB 增益（G通道归一化）"""
-    white_patch_rgb = np.clip(white_patch_rgb.astype(np.float32), 1e-4, None)
-    green = white_patch_rgb[1]
-    gain = np.array([green / white_patch_rgb[0], 1.0, green / white_patch_rgb[2]], dtype=np.float32)
-    return np.clip(gain, 0.25, 4.0)
+    def to_display(ox, oy):
+        return (ox - state['pan_x']) * state['scale'], (oy - state['pan_y']) * state['scale']
+
+    def mouse_cb(event, x, y, flags, _):
+        s = state
+        if event == cv2.EVENT_MOUSEWHEEL:
+            orig = to_orig(x, y)
+            factor = 1.2 if flags > 0 else 1 / 1.2
+            new_scale = max(init_scale, min(s['scale'] * factor, init_scale * 10))
+            s['pan_x'] = orig[0] - x / new_scale
+            s['pan_y'] = orig[1] - y / new_scale
+            s['scale'] = new_scale
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            s['pan_ref'] = (x, y, s['pan_x'], s['pan_y'])
+        elif event == cv2.EVENT_MOUSEMOVE and s['pan_ref'] and (flags & cv2.EVENT_FLAG_RBUTTON):
+            sx, sy, ox, oy = s['pan_ref']
+            s['pan_x'] = ox - (x - sx) / s['scale']
+            s['pan_y'] = oy - (y - sy) / s['scale']
+        elif event == cv2.EVENT_RBUTTONUP:
+            s['pan_ref'] = None
+        elif event == cv2.EVENT_MBUTTONDOWN:
+            s['scale'], s['pan_x'], s['pan_y'] = init_scale, 0.0, 0.0
+        elif event == cv2.EVENT_LBUTTONDOWN:
+            s['roi_start'] = to_orig(x, y)
+            s['roi_end'] = s['roi_start']
+            s['drawing'] = True
+        elif event == cv2.EVENT_MOUSEMOVE and s['drawing'] and (flags & cv2.EVENT_FLAG_LBUTTON):
+            s['roi_end'] = to_orig(x, y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            s['roi_end'] = to_orig(x, y)
+            s['drawing'] = False
+
+    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_title, int(w * init_scale), int(h * init_scale))
+    cv2.setMouseCallback(window_title, mouse_cb)
+
+    while True:
+        s = state
+        vw, vh = WIN_W / s['scale'], WIN_H / s['scale']
+        s['pan_x'] = max(0.0, min(s['pan_x'], w - vw))
+        s['pan_y'] = max(0.0, min(s['pan_y'], h - vh))
+
+        x1, y1 = int(s['pan_x']), int(s['pan_y'])
+        x2, y2 = min(w, x1 + int(vw) + 1), min(h, y1 + int(vh) + 1)
+        disp = cv2.resize(display_img[y1:y2, x1:x2], (WIN_W, WIN_H), interpolation=cv2.INTER_LINEAR)
+
+        # 绘制 ROI
+        if s['roi_start'] and s['roi_end']:
+            rx1, ry1 = to_display(min(s['roi_start'][0], s['roi_end'][0]),
+                                   min(s['roi_start'][1], s['roi_end'][1]))
+            rx2, ry2 = to_display(max(s['roi_start'][0], s['roi_end'][0]),
+                                   max(s['roi_start'][1], s['roi_end'][1]))
+            cv2.rectangle(disp, (int(rx1), int(ry1)), (int(rx2), int(ry2)), (0, 255, 0), 2)
+
+        zoom_pct = int(s['scale'] / init_scale * 100)
+        cv2.putText(disp, f"Zoom: {zoom_pct}%", (WIN_W - 150, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(disp, "Scroll=Zoom  Right-drag=Pan  Mid=Reset  Left-drag=ROI  SPACE=OK  ESC=Cancel",
+                    (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.imshow(window_title, disp)
+
+        key = cv2.waitKey(16) & 0xFF
+        if key == 27:
+            cv2.destroyWindow(window_title)
+            return None
+        if key in (13, 32) and s['roi_start'] and s['roi_end']:
+            rx1 = int(min(s['roi_start'][0], s['roi_end'][0]))
+            ry1 = int(min(s['roi_start'][1], s['roi_end'][1]))
+            rx2 = int(max(s['roi_start'][0], s['roi_end'][0]))
+            ry2 = int(max(s['roi_start'][1], s['roi_end'][1]))
+            cv2.destroyWindow(window_title)
+            return (rx1, ry1, rx2, ry2) if rx2 - rx1 >= 10 and ry2 - ry1 >= 10 else None
 
 
 # ==============================================================================
@@ -303,76 +234,52 @@ def compute_awb_gain(white_patch_rgb: np.ndarray) -> np.ndarray:
 
 def extract_awb_gt(
     image: np.ndarray,
-    method: str = "colorchecker",
     roi: Optional[Tuple[int, int, int, int]] = None,
+    interactive: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
-    统一 GT 提取接口。
+    提取 AWB Ground Truth。
 
     参数:
-        image:    RGB图像 [H, W, 3], float32, range [0, 1]
-        method:   "colorchecker" 或 "white_patch"
-        roi:      可选 ROI (x0, y0, x1, y1)，仅 colorchecker 模式使用
+        image: RGB 图像 [H, W, 3], float32, range [0, 1]
+        roi: 灰阶行 ROI (x0, y0, x1, y1)，指定后跳过手动框选
+        interactive: True=手动框选(默认), False=必须提供 roi
 
     返回:
         {
-            "awb_gt_gain":    (3,) AWB 增益 [R_gain, 1.0, B_gain]
-            "white_patch_rgb": (3,) 白块/灰阶块 RGB 均值
-            "white_patch_box": (4,) bbox (x0, y0, x1, y1)
-            "white_patch_score": (3,) [score_max, score_min, patch_fraction]
-            "gt_method":      str, 实际使用的方法
+            "awb_gt_gain":     (3,) AWB 增益 [R_gain, 1.0, B_gain]
+            "gray_patch_rgb":  (3,) 灰阶块 RGB 均值
+            "gray_patch_box":  (4,) 灰阶行 bbox
+            "gt_method":       str
+            "gray_patch_boxes": (6,4) 各灰阶块 bbox
+            "used_indices":    (M,) 用于 gain 计算的索引
         }
     """
     image = _ensure_float01(image)
 
-    if method == "colorchecker":
-        if roi is not None:
-            gray_patches, _ = detect_colorchecker_roi(image, roi)
-            success = True
-            bbox = np.array([roi[0], roi[1], roi[2], roi[3]], dtype=np.int32)
-            white_patch_rgb = gray_patches.mean(axis=0)
-            gt_method = "colorchecker_roi"
-        else:
-            result = detect_colorchecker_auto(image)
-            if result is not None:
-                gray_patches, centers = result
-                white_patch_rgb = gray_patches.mean(axis=0)
-                # bbox 取灰阶块的包围盒
-                x0 = int(centers[:, 0].min()) - 10
-                y0 = int(centers[:, 1].min()) - 10
-                x1 = int(centers[:, 0].max()) + 10
-                y1 = int(centers[:, 1].max()) + 10
-                bbox = np.array([x0, y0, x1, y1], dtype=np.int32)
-                gt_method = "colorchecker_auto"
-                success = True
-            else:
-                # 自动检测失败，回退到 white_patch
-                print("  [WARN] ColorChecker auto-detection failed, falling back to white_patch")
-                gt_method = "white_patch_fallback"
-                success = False
+    if roi is not None:
+        gray_patches, _, patch_bboxes = detect_gray_row_patches(image, roi)
+        bbox = np.array(roi, dtype=np.int32)
+        gt_method = "gray_row_roi"
+    elif interactive:
+        print("  [INFO] 请框选灰阶行 (6 个灰阶块, SPACE/ENTER 确认, ESC 取消)")
+        roi_manual = _manual_select_roi(image)
+        if roi_manual is None:
+            raise ValueError("手动框选取消")
+        gray_patches, _, patch_bboxes = detect_gray_row_patches(image, roi_manual)
+        bbox = np.array(roi_manual, dtype=np.int32)
+        gt_method = "gray_row_manual"
+    else:
+        raise ValueError("非交互模式必须提供 --roi 参数")
 
-        if success and method == "colorchecker" and gt_method.startswith("colorchecker"):
-            gain = compute_gain_from_gray_patches(gray_patches)
-            return {
-                "awb_gt_gain": gain,
-                "white_patch_rgb": white_patch_rgb,
-                "white_patch_box": bbox,
-                "white_patch_score": np.array([1.0, 0.0, 0.1], dtype=np.float32),
-                "gt_method": np.array(gt_method),
-            }
-
-    # white_patch 方法（或 colorchecker 的回退）
-    bbox, white_patch_rgb, diagnostics = detect_white_patch(image)
-    gain = compute_awb_gain(white_patch_rgb)
+    gain, used_indices = compute_gain_from_gray_patches(gray_patches)
     return {
         "awb_gt_gain": gain,
-        "white_patch_rgb": white_patch_rgb,
-        "white_patch_box": np.array(bbox, dtype=np.int32),
-        "white_patch_score": np.array(
-            [diagnostics["score_max"], diagnostics["score_min"], diagnostics["patch_fraction"]],
-            dtype=np.float32,
-        ),
-        "gt_method": np.array("white_patch"),
+        "gray_patch_rgb": gray_patches.mean(axis=0),
+        "gray_patch_box": bbox,
+        "gt_method": np.array(gt_method),
+        "gray_patch_boxes": patch_bboxes,
+        "used_indices": used_indices,
     }
 
 
@@ -383,12 +290,13 @@ def extract_awb_gt(
 def render_gt_debug(
     image: np.ndarray,
     bbox: np.ndarray,
-    white_patch_rgb: np.ndarray,
     gain: np.ndarray,
     save_path: str,
     method: str = "unknown",
+    gray_patch_boxes: Optional[np.ndarray] = None,
+    used_indices: Optional[np.ndarray] = None,
 ) -> Optional[str]:
-    """将检测到的白块位置和 GT 增益渲染到图像上，保存调试图。"""
+    """将灰阶块位置和 GT 增益渲染到图像上，保存调试图。"""
     if image is None:
         return None
 
@@ -398,27 +306,34 @@ def render_gt_debug(
     # 应用 GT 增益得到白平衡预览
     gain_reshaped = gain.reshape(1, 1, 3).astype(np.float32)
     balanced = np.clip(image * gain_reshaped, 0.0, 1.0)
-
-    # 自动曝光 + gamma 校正
     preview = _auto_expose(balanced)
     preview = (preview[..., ::-1] * 255.0).astype(np.uint8)
 
-    # 绘制 bbox
+    # 绘制灰阶行 ROI
     x0, y0, x1, y1 = [int(v) for v in bbox.tolist()]
     cv2.rectangle(preview, (x0, y0), (x1, y1), (0, 255, 0), 2)
 
-    text = "[{}] rgb={:.3f}/{:.3f}/{:.3f} gain={:.2f}/{:.2f}/{:.2f}".format(
-        method,
-        white_patch_rgb[0], white_patch_rgb[1], white_patch_rgb[2],
-        gain[0], gain[1], gain[2],
-    )
+    # 绘制各灰阶块
+    if gray_patch_boxes is not None and len(gray_patch_boxes) > 0:
+        used_set = set(used_indices.tolist()) if used_indices is not None else set()
+        for i, (px0, py0, px1, py1) in enumerate(gray_patch_boxes):
+            px0, py0, px1, py1 = int(px0), int(py0), int(px1), int(py1)
+            if i in used_set:
+                overlay = preview.copy()
+                cv2.rectangle(overlay, (px0, py0), (px1, py1), (0, 255, 0), -1)
+                cv2.addWeighted(overlay, 0.35, preview, 0.65, 0, preview)
+                cv2.rectangle(preview, (px0, py0), (px1, py1), (0, 200, 0), 2)
+            else:
+                cv2.rectangle(preview, (px0, py0), (px1, py1), (255, 255, 0), 1)
+
+    text = "[{}] gain={:.2f}/{:.2f}/{:.2f}".format(method, gain[0], gain[1], gain[2])
     cv2.putText(preview, text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
     cv2.imwrite(save_path, preview)
     return save_path
 
 
 # ==============================================================================
-# 批处理：读取 raw NPZ → 添加 GT → 输出到 image_processed
+# 批处理
 # ==============================================================================
 
 def _parse_roi(roi_str: str) -> Tuple[int, int, int, int]:
@@ -432,28 +347,21 @@ def process_raw_npz(
     npz_path: str,
     output_dir: str,
     debug_dir: str,
-    method: str = "colorchecker",
     roi: Optional[Tuple[int, int, int, int]] = None,
-    size: int = 256,
+    interactive: bool = True,
 ) -> None:
-    """
-    读取解码后的 raw NPZ，添加 GT 后保存为完整 NPZ。
-    输出格式兼容 dataloader。
-    """
+    """读取解码后的 raw NPZ，添加 GT 后保存。"""
     raw_data = np.load(npz_path, allow_pickle=True)
 
-    # 读取全分辨率 RAW 图像用于 GT 检测（精度更高）
     if "image_full" in raw_data:
         image_for_gt = raw_data["image_full"]
     else:
         image_for_gt = raw_data["image"]
 
-    # 提取 GT
-    gt_result = extract_awb_gt(image_for_gt, method=method, roi=roi)
+    gt_result = extract_awb_gt(image_for_gt, roi=roi, interactive=interactive)
 
-    # 构建兼容 dataloader 的输出
     sample = {
-        "image": raw_data["image"],  # 已缩放的图像
+        "image": raw_data["image"],
         "image_full": raw_data["image_full"],
         "focal_length": raw_data["focal_length"],
         "focal_length_35mm": raw_data["focal_length_35mm"],
@@ -463,39 +371,35 @@ def process_raw_npz(
         "raw_resolution": raw_data["raw_resolution"],
         "processed_resolution": raw_data["processed_resolution"],
         "crop_strategy": np.array("intrinsics_fallback_center_crop"),
-        # GT 字段
         "awb_gt_gain": gt_result["awb_gt_gain"],
-        "white_patch_rgb": gt_result["white_patch_rgb"],
-        "white_patch_box": gt_result["white_patch_box"],
-        "white_patch_score": gt_result["white_patch_score"],
+        "gray_patch_rgb": gt_result["gray_patch_rgb"],
+        "gray_patch_box": gt_result["gray_patch_box"],
         "gt_method": gt_result["gt_method"],
     }
 
-    # 保存
     safe_name = os.path.splitext(os.path.basename(npz_path))[0]
     out_path = os.path.join(output_dir, f"{safe_name}.npz")
     np.savez(out_path, **sample)
 
-    # 调试可视化
     debug_path = os.path.join(debug_dir, f"{safe_name}_gt_debug.png")
     render_gt_debug(
         image=image_for_gt,
-        bbox=gt_result["white_patch_box"],
-        white_patch_rgb=gt_result["white_patch_rgb"],
+        bbox=gt_result["gray_patch_box"],
         gain=gt_result["awb_gt_gain"],
         save_path=debug_path,
-        method=str(gt_result.get("gt_method", method)),
+        method=str(gt_result["gt_method"]),
+        gray_patch_boxes=gt_result.get("gray_patch_boxes"),
+        used_indices=gt_result.get("used_indices"),
     )
 
-    print(f"  OK: {safe_name} | gt_gain={gt_result['awb_gt_gain'].tolist()} | method={gt_result['gt_method']}")
+    print(f"  OK: {safe_name} | gain={gt_result['awb_gt_gain'].tolist()} | method={gt_result['gt_method']}")
 
 
 def batch_process(
     input_dir: str,
     output_dir: str,
-    method: str = "colorchecker",
     roi: Optional[Tuple[int, int, int, int]] = None,
-    size: int = 256,
+    interactive: bool = True,
 ) -> None:
     """批量处理目录下的所有 raw NPZ 文件。"""
     os.makedirs(output_dir, exist_ok=True)
@@ -503,18 +407,16 @@ def batch_process(
     os.makedirs(debug_dir, exist_ok=True)
 
     npz_files = sorted([f for f in os.listdir(input_dir) if f.endswith(".npz")])
-
     if not npz_files:
         print(f"Warning: No NPZ files found in {input_dir}")
-        print(f"  Run dng_decoder.py first to decode DNG files.")
         return
 
-    print(f"Found {len(npz_files)} NPZ files, extracting GT (method={method})...")
+    print(f"Found {len(npz_files)} NPZ files, extracting GT (interactive={interactive})...")
 
     for npz_file in npz_files:
         npz_path = os.path.join(input_dir, npz_file)
         try:
-            process_raw_npz(npz_path, output_dir, debug_dir, method=method, roi=roi, size=size)
+            process_raw_npz(npz_path, output_dir, debug_dir, roi=roi, interactive=interactive)
         except Exception as exc:
             print(f"  FAIL: {npz_file} -> {exc}")
 
@@ -522,14 +424,13 @@ def batch_process(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AWB Ground Truth 提取（独立于 DNG 解码）")
+    parser = argparse.ArgumentParser(description="AWB Ground Truth 提取 — 灰阶行框选模式")
     parser.add_argument("--input_dir", default="image_raw", help="decoder 输出的 raw NPZ 目录")
-    parser.add_argument("--output_dir", default="image_processed", help="输出完整 NPZ 目录（兼容 dataloader）")
-    parser.add_argument("--method", default="colorchecker", choices=["colorchecker", "white_patch"],
-                        help="GT 提取方法: colorchecker（推荐）或 white_patch")
+    parser.add_argument("--output_dir", default="image_processed", help="输出 NPZ 目录")
     parser.add_argument("--roi", type=str, default=None,
-                        help="色卡 ROI (x0,y0,x1,y1)，指定后跳过自动检测直接使用该区域")
-    parser.add_argument("--size", type=int, default=256, help="输出图像尺寸")
+                        help="灰阶行 ROI (x0,y0,x1,y1)，指定后跳过手动框选")
+    parser.add_argument("--no_interactive", dest="interactive", action="store_false",
+                        help="非交互模式（必须配合 --roi 使用）")
     args = parser.parse_args()
 
     roi = _parse_roi(args.roi) if args.roi else None
@@ -537,9 +438,8 @@ def main() -> None:
     batch_process(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
-        method=args.method,
         roi=roi,
-        size=args.size,
+        interactive=args.interactive,
     )
 
 

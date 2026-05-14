@@ -3,6 +3,9 @@ import random
 import sys
 
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -11,10 +14,58 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config_loader import load_config, build_lr_scheduler
 from dataloader import AWBDataset
-from geometry_utils import safe_inv_ccm
-from loss import total_loss, build_srgb_gt, srgb_gamma, XYZ_TO_SRGB
+from geometry_utils import safe_inv_ccm, srgb_gamma, XYZ_TO_SRGB
+from loss import total_loss, build_srgb_gt
 from model import AWBTransformer
 from visualization import save_debug_scene, save_mcs_alignment_debug
+
+
+def plot_loss_curves(
+    epochs: list,
+    loss_history: dict,
+    output_dir: str,
+) -> None:
+    """绘制 loss 随 epoch 变化的可视化图表（实时更新）。
+
+    Args:
+        epochs: epoch 列表
+        loss_history: {loss_name: [value_per_epoch, ...]}
+        output_dir: 输出目录
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    all_names = list(loss_history.keys())
+    n_losses = len(all_names)
+
+    # 布局：total 占第一行，其余分项占第二行
+    sub_names = [k for k in all_names if k != "total"]
+    n_sub = len(sub_names)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    # 上图：total loss
+    ax = axes[0]
+    ax.plot(epochs, loss_history["total"], label="total", linewidth=2, color="tab:red")
+    ax.set_ylabel("Loss")
+    ax.set_title("Total Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 下图：所有分项 loss
+    ax = axes[1]
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_sub, 1)))
+    for i, name in enumerate(sub_names):
+        ax.plot(epochs, loss_history[name], label=name, color=colors[i])
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Loss Components")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, "loss_curves.png")
+    plt.savefig(save_path, dpi=150)
+    plt.close()
 
 
 def train(config_path: str = "config.yaml"):
@@ -89,6 +140,10 @@ def train(config_path: str = "config.yaml"):
         metric_names.append("srgb")
     if smoothness_weight > 0:
         metric_names.append("smoothness")
+
+    # loss 历史记录
+    loss_history = {name: [] for name in metric_names}
+    epoch_list = []
 
     for epoch in range(start_epoch, cfg.training.epochs):
         epoch_metrics = {k: 0.0 for k in metric_names}
@@ -192,6 +247,14 @@ def train(config_path: str = "config.yaml"):
             parts.append(f"{name}={epoch_metrics[name] / num_steps:.4f}")
         parts.append(f"lr={current_lr:.2e}")
         print(" ".join(parts))
+
+        # 记录 loss 历史
+        epoch_list.append(epoch)
+        for name in metric_names:
+            loss_history[name].append(epoch_metrics[name] / num_steps)
+
+        # ===== 实时更新 loss 曲线 =====
+        plot_loss_curves(epoch_list, loss_history, cfg.debug.output_dir)
 
         # ===== Checkpoint 保存 =====
         checkpoint_state = {

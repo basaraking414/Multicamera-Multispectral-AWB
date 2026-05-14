@@ -71,10 +71,10 @@ training:
     threshold: 0.0001
 
   loss_weights:
-    awb: 1.0
-    reconstruction: 10.0
-    consistency: 2.0
-    srgb: 1.0  # sRGB损失权重，需同时设置 model.predict_ccm: true
+    awb: 1              # 角度损失权重（atan2，范围 [0, π]）
+    reconstruction: 500.0  # 重建损失权重（L1）
+    consistency: 1     # Lab色度一致性权重（a,b通道色差）
+    srgb: 1           # CIE76 Lab色差权重，需同时设置 model.predict_ccm: true
 
   loss_crop_size: 32            # 后裁剪统一尺寸（全视场模式下裁剪重叠区算 loss）
   smoothness_weight: 0.05       # 空间平滑损失权重，0 则关闭
@@ -93,7 +93,7 @@ checkpoint:
 # 调试
 # ---------------------------------------------------------------------------
 debug:
-  output_dir: "./debug_outputs"
+  output_dir: "./outputs"
   save_interval: 5             # 每隔 N 个 epoch 保存 debug 图像
 
 # ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ test:
   root_dir: "./data"                  # 测试集根目录（与训练数据相同结构：image_processed/ + Mcsnpy/）
   checkpoint: "./checkpoints/best_model.pth"  # 测试用的模型权重
   batch_size: 1
-  output_dir: "./debug_outputs/test_outputs"
+  output_dir: "./outputs/test"
   img_size: [64, 64]
   mcs_size: [64, 64]
   loss_crop_size: 32                       # 后裁剪尺寸（默认与 training.loss_crop_size 一致）
@@ -113,7 +113,7 @@ test:
 # ---------------------------------------------------------------------------
 inference:
   checkpoint: "./checkpoints/best_model.pth"  # 推理用的模型权重
-  output_dir: "./inference_outputs"
+  output_dir: "./outputs/inference"
   save_gain_map: true
   save_corrected_image: true
   img_size: [64, 64]
