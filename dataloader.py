@@ -65,9 +65,9 @@ class AWBDataset(Dataset):
                     if "awb_gt_gain" in img_data
                     else np.ones(3, dtype=np.float32)
                 )
-                white_patch_rgb = (
-                    img_data["white_patch_rgb"].astype(np.float32)
-                    if "white_patch_rgb" in img_data
+                gray_patch_rgb = (
+                    img_data["gray_patch_rgb"].astype(np.float32)
+                    if "gray_patch_rgb" in img_data
                     else np.ones(3, dtype=np.float32)
                 )
 
@@ -81,10 +81,10 @@ class AWBDataset(Dataset):
                     "scene_id": np.int64(scene_id),
                     "file_name": str(img_data["file_name"]),
                     "awb_gt_gain": awb_gt_gain,
-                    "white_patch_rgb": white_patch_rgb,
-                    "white_patch_box": (
-                        img_data["white_patch_box"].astype(np.int32)
-                        if "white_patch_box" in img_data
+                    "gray_patch_rgb": gray_patch_rgb,
+                    "gray_patch_box": (
+                        img_data["gray_patch_box"].astype(np.int32)
+                        if "gray_patch_box" in img_data
                         else np.zeros(4, dtype=np.int32)
                     ),
                     "crop_strategy": (
@@ -112,7 +112,7 @@ class AWBDataset(Dataset):
         gt_images = []
         mcs_maps = []
         awb_gt_gain = []
-        white_patch_rgb = []
+        gray_patch_rgb = []
         crop_ratios = []
         sensor_ids = []
         scene_ids = []
@@ -157,7 +157,7 @@ class AWBDataset(Dataset):
             gt_images.append(gt_image)
             mcs_maps.append(mcs.astype(np.float32))
             awb_gt_gain.append(gain)
-            white_patch_rgb.append(sample["white_patch_rgb"])
+            gray_patch_rgb.append(sample["gray_patch_rgb"])
             crop_ratios.append(np.float32(crop_ratio))
             sensor_ids.append(sample["sensor_id"])
             scene_ids.append(sample["scene_id"])
@@ -169,7 +169,7 @@ class AWBDataset(Dataset):
             "gt_image": torch.from_numpy(np.stack(gt_images, axis=0)),
             "mcs": torch.from_numpy(np.stack(mcs_maps, axis=0)),
             "awb_gt_gain": torch.from_numpy(np.stack(awb_gt_gain, axis=0)),
-            "white_patch_rgb": torch.from_numpy(np.stack(white_patch_rgb, axis=0)),
+            "gray_patch_rgb": torch.from_numpy(np.stack(gray_patch_rgb, axis=0)),
             "crop_ratio": torch.from_numpy(np.array(crop_ratios, dtype=np.float32)),
             "sensor_id": torch.from_numpy(np.array(sensor_ids, dtype=np.int64)),
             "scene_id": torch.from_numpy(np.array(scene_ids, dtype=np.int64)),
