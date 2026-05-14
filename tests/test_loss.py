@@ -3,13 +3,13 @@
 import pytest
 import torch
 
+from geometry_utils import srgb_gamma
 from loss import (
     angular_loss,
     reconstruction_loss,
     scene_consistency_loss,
     srgb_loss,
     spatial_smoothness_loss,
-    srgb_gamma,
     build_srgb_gt,
     crop_to_overlap,
     total_loss,

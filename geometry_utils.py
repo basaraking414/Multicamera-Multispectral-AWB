@@ -184,3 +184,126 @@ def safe_inv_ccm(ccm: torch.Tensor, eps_factor: float = 10.0) -> torch.Tensor:
     eps = max(1e-6, torch.finfo(ccm.dtype).eps * eps_factor)
     eye = torch.eye(3, device=ccm.device, dtype=ccm.dtype).unsqueeze(0)
     return torch.linalg.inv(ccm.float() + eps * eye)
+
+
+# =============================================================================
+# 颜色空间转换工具
+# =============================================================================
+
+# CIE标准XYZ到sRGB转换矩阵(D65光源)
+XYZ_TO_SRGB = torch.tensor([
+    [3.2406, -1.5372, -0.4986],
+    [-0.9689, 1.8758, 0.0415],
+    [0.0557, -0.2040, 1.0570],
+], dtype=torch.float32)
+
+
+def srgb_gamma(linear: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """线性光 → sRGB gamma 校正（标准 sRGB 分段曲线）。"""
+    mask = linear <= 0.0031308
+    srgb = torch.where(
+        mask,
+        12.92 * linear,
+        1.055 * torch.clamp(linear, min=eps).pow(1.0 / 2.4) - 0.055,
+    )
+    return torch.clamp(srgb, 0.0, 1.0)
+
+
+# D65 标准白点 (2° 标准观察者)
+_D65_WHITE = torch.tensor([0.95047, 1.0, 1.08883], dtype=torch.float32)
+
+# sRGB → XYZ 矩阵 (D65)
+_SRGB_TO_XYZ = torch.tensor([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041],
+], dtype=torch.float32)
+
+# Lab 转换阈值
+_LAB_DELTA = 6.0 / 29.0
+_LAB_DELTA_SQ = _LAB_DELTA ** 2  # 0.042806...
+_LAB_DELTA_CB = _LAB_DELTA ** 3  # 0.008856...
+
+
+def srgb_to_linear(srgb: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """sRGB gamma 反函数：sRGB → linear RGB。
+
+    Args:
+        srgb: [..., 3] sRGB 值，范围 [0, 1]
+    Returns:
+        linear: [..., 3] 线性 RGB 值
+    """
+    mask = srgb <= 0.04045
+    linear = torch.where(
+        mask,
+        srgb / 12.92,
+        torch.clamp((srgb + 0.055) / 1.055, min=eps).pow(2.4),
+    )
+    return torch.clamp(linear, 0.0, 1.0)
+
+
+def linear_rgb_to_xyz(rgb: torch.Tensor) -> torch.Tensor:
+    """线性 RGB → XYZ (D65 白点)。
+
+    Args:
+        rgb: [..., 3] 线性 RGB
+    Returns:
+        xyz: [..., 3] CIE XYZ
+    """
+    mat = _SRGB_TO_XYZ.to(rgb.device, rgb.dtype)
+    return torch.matmul(rgb, mat.T)
+
+
+def xyz_to_lab(xyz: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """CIE XYZ → CIE Lab (D65 白点归一化)。
+
+    Args:
+        xyz: [..., 3] CIE XYZ 值
+    Returns:
+        lab: [..., 3] CIE Lab (L: 0~100, a: -128~127, b: -128~127)
+    """
+    white = _D65_WHITE.to(xyz.device, xyz.dtype)
+    # 归一化到白点
+    xyz_norm = xyz / white
+
+    # f(t) 条件函数
+    t = xyz_norm
+    mask = t > _LAB_DELTA_CB
+    f = torch.where(
+        mask,
+        torch.clamp(t, min=eps).pow(1.0 / 3.0),
+        t / (3 * _LAB_DELTA_SQ) + 4.0 / 29.0,
+    )
+
+    fx, fy, fz = f[..., 0], f[..., 1], f[..., 2]
+
+    L = 116.0 * fy - 16.0
+    a = 500.0 * (fx - fy)
+    b = 200.0 * (fy - fz)
+
+    return torch.stack([L, a, b], dim=-1)
+
+
+def srgb_to_lab(srgb: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """sRGB → CIE Lab (组合函数)。
+
+    Args:
+        srgb: [..., 3] sRGB 值，范围 [0, 1]
+    Returns:
+        lab: [..., 3] CIE Lab
+    """
+    linear = srgb_to_linear(srgb, eps=eps)
+    xyz = linear_rgb_to_xyz(linear)
+    return xyz_to_lab(xyz, eps=eps)
+
+
+def linear_rgb_to_lab(rgb: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """线性 RGB → CIE Lab (用于 loss 计算)。
+
+    Args:
+        rgb: [..., 3] 线性 RGB 值
+    Returns:
+        lab: [..., 3] CIE Lab
+    """
+    xyz = linear_rgb_to_xyz(rgb)
+    return xyz_to_lab(xyz, eps=eps)
